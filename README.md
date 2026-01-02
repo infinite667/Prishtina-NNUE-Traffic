@@ -1,4 +1,4 @@
-# Prishtina Traffic Simulation + NNUE (Localhost:667)
+# Prishtina Traffic Simulation + NNUE (Localhost:9999)
 
 This project runs a real-time traffic simulation over a lightweight road network for **Prishtina** and overlays **traffic lights from GeoJSON**.
 A small "NNUE-style" incremental neural model can (optionally) re-route vehicles away from congested roads.
