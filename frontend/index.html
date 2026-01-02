@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Prishtina Traffic Simulation</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <div id="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <div>
+        <div class="title">Prishtina Traffic Simulation</div>
+        <div class="subtitle">Real-time traffic + optional NNUE re-routing</div>
+      </div>
+    </div>
+
+    <div class="right-controls">
+      <button id="settingsBtn" class="btn">Settings</button>
+    </div>
+  </div>
+
+  <div id="layout">
+    <div id="map"></div>
+
+    <div id="panel">
+      <div class="panel-card">
+        <div class="panel-title">Legend</div>
+        <div class="legend">
+          <div class="legend-row">
+            <img id="legendCarMoving" class="legend-img" alt="Moving vehicle" />
+            <span>Moving vehicle</span>
+          </div>
+          <div class="legend-row">
+            <img id="legendCarWaiting" class="legend-img" alt="Waiting vehicle" />
+            <span>Waiting / queued</span>
+          </div>
+          <div class="legend-row">
+            <img id="legendCarArrived" class="legend-img" alt="Arrived vehicle" />
+            <span>Arrived</span>
+          </div>
+          <div class="legend-row">
+            <img id="legendLightGreen" class="legend-img" alt="Green traffic light" />
+            <span>Traffic light (green)</span>
+          </div>
+          <div class="legend-row">
+            <img id="legendLightYellow" class="legend-img" alt="Yellow traffic light" />
+            <span>Traffic light (yellow)</span>
+          </div>
+          <div class="legend-row">
+            <img id="legendLightRed" class="legend-img" alt="Red traffic light" />
+            <span>Traffic light (red)</span>
+          </div>
+        
+      <!-- (removed) simulation-time counter -->
+</div>
+      </div>
+
+      <div class="panel-card">
+        <div class="panel-title">Vehicles on map</div>
+        <div class="metric" style="margin-top:6px;">
+          <div class="metric-value"><span id="vehiclesOnMap">0</span></div>
+          <div class="metric-sub">Live count of vehicle markers currently being simulated</div>
+        </div>
+      </div>
+
+      <div class="panel-card">
+        <div class="panel-title">City Avg Waiting Time</div>
+        <div class="metric">
+          <div class="metric-value"><span id="avgWait">0.0</span><span class="metric-unit">s</span></div>
+          <div class="metric-sub">Average accumulated waiting per active vehicle</div>
+        </div>
+        <canvas id="waitChart" height="120"></canvas>
+      </div>
+
+      <div class="panel-card">
+        <div class="panel-title">Selection</div>
+        <div id="selectionEmpty" class="muted">Click a vehicle or traffic light.</div>
+        <div id="selectionDetails" class="details hidden"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modalBackdrop" class="backdrop hidden"></div>
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Settings</div>
+        <div class="modal-sub">Tweak simulation behavior</div>
+      </div>
+      <button id="closeSettings" class="icon-btn">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">Vehicle Count</div>
+          <div class="setting-sub">200 → 500 → 1000 → 3000</div>
+        </div>
+      </div>
+      <div class="slider-row">
+        <input id="vehicleCountSlider" type="range" min="0" max="3" value="1" step="1"/>
+        <div class="slider-value"><span id="vehicleCountValue">500</span></div>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">NNUE Re-routing</div>
+          <div class="setting-sub">When ON, vehicles may take longer routes to reduce congestion.</div>
+        </div>
+        <button id="nnueToggle" class="toggle" aria-pressed="false">
+          <span class="toggle-knob"></span>
+        </button>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-title">Simulation Speed</div>
+          <div class="setting-sub">0.5× (slow) to 5× (fast)</div>
+        </div>
+      </div>
+      <div class="slider-row">
+        <input id="speedSlider" type="range" min="0.5" max="5" value="1" step="0.1"/>
+        <div class="slider-value"><span id="speedValue">1.0</span>×</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
