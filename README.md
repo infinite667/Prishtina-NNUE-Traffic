@@ -23,7 +23,7 @@ pip install -r requirements.txt
 python -m backend.main
 ```
 
-Then open: `http://localhost:667`
+Then open: `http://localhost:9999`
 
 ## Notes about the road network (no SUMO / no osmnx)
 - On first run, the backend tries to download Prishtina roads via **Overpass API** and caches them to `data/roads_cache.json`.
