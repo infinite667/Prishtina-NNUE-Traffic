@@ -1,1 +1,13 @@
-
+<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28">
+  <defs>
+    <filter id="s" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="rgba(0,0,0,.45)"/>
+    </filter>
+  </defs>
+  <g filter="url(#s)">
+    <rect x="6" y="10" width="16" height="8" rx="3" fill="CURRENT"/>
+    <rect x="9" y="8" width="10" height="5" rx="2" fill="CURRENT" opacity=".85"/>
+    <circle cx="9" cy="19" r="2" fill="white" opacity=".9"/>
+    <circle cx="19" cy="19" r="2" fill="white" opacity=".9"/>
+  </g>
+</svg>
