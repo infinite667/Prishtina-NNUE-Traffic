@@ -189,6 +189,32 @@ class EdgeLearner:
             # Sleep tiny amount to yield CPU to sim
             time.sleep(0.005)
 
+    def maybe_save(self, min_interval_s: float = 5.0) -> None:
+        """
+        Save the model if enough time has passed since last save.
+        """
+        now = time.time()
+        # We can implement a simple throttle here.
+        # Note: The background dreamer also saves periodically.
+        # This method allows the MAIN thread to trigger a save (e.g. on shutdown or periodically).
+        # To avoid race conditions with the dreamer saving, we should probably just let the dreamer do it,
+        # OR share the lock. But `TinyNNUE.save` is just atomic pickle dump, so it's mostly fine
+        # if we don't interleave writes corruptly. 
+        # For safety, let's just ignore this call if the dreamer is running, 
+        # or implement a flag. Actually, `_dream_loop` has a 30s timer.
+        # If the sim calls this explicitly, we should save.
+        
+        # Simple throttle
+        if not hasattr(self, "_last_explicit_save"):
+            self._last_explicit_save = 0.0
+            
+        if now - self._last_explicit_save < min_interval_s:
+            return
+            
+        self._last_explicit_save = now
+        # Save the inference model (which is synced from dreamer)
+        self.nnue.save(self.model_path)
+
     def shutdown(self):
         self._stop_event.set()
         if self._thread.is_alive():
