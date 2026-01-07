@@ -275,7 +275,7 @@ function applySettingsUI() {
   slider.value = state.settings.speed_multiplier;
   document.getElementById("speedValue").innerText = Number(state.settings.speed_multiplier).toFixed(1);
 
-  const mapping = [200, 500, 1000, 3000];
+  const mapping = [200, 500, 750, 1000];
   const vcSlider = document.getElementById("vehicleCountSlider");
   const idx = Math.max(0, mapping.indexOf(state.settings.target_vehicle_count));
   vcSlider.value = String(idx === -1 ? 1 : idx);
@@ -322,7 +322,7 @@ function initSettingsModal() {
     await postSettings({ speed_multiplier: Number(slider.value) });
   });
 
-  const mapping = [200, 500, 1000, 3000];
+  const mapping = [200, 500, 750, 1000];
   const vcSlider = document.getElementById("vehicleCountSlider");
   vcSlider.addEventListener("input", () => {
     const val = mapping[Number(vcSlider.value)];
