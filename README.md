@@ -26,7 +26,7 @@ It features a cutting-edge **Hybrid AI System** that combines classical pathfind
 
 ---
 
-##  Backend Architecture
+##  Architecture
 
 - Python 3.11+ / FastAPI / WebSockets.
 
