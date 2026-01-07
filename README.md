@@ -1,10 +1,10 @@
-# Prishtina Traffic Simulation + AI "Dreamer" (Localhost:9999)
+# Prishtina NNUE Traffic
 
 This project runs a high-fidelity real-time traffic simulation over a large-scale road network for **Prishtina** (40,000+ nodes), overlaid with live traffic lights and autonomous vehicles.
 
 It features a cutting-edge **Hybrid AI System** that combines classical pathfinding with a **Neural Network (NNUE)** to learn and avoid traffic jams in real-time.
 
-## 🚀 Key Features
+## Some of the key Features
 
 ### 1. Smart Traffic AI (The "Dreamer")
 -   **Neural Network Update Engine (NNUE)**: A vectorized Numpy-based neural network that learns to predict edge delays.
@@ -26,15 +26,9 @@ It features a cutting-edge **Hybrid AI System** that combines classical pathfind
 
 ---
 
-## 🛠️ Architecture & Performance
+##  Backend Architecture
 
--   **Backend**: Python 3.11+ / FastAPI / WebSockets.
--   **Simulation Loop**: Ticks at **30Hz-60Hz** (adaptive).
--   **Performance Optimizations**:
-    -   **O(1)** Traffic Light Lookups.
-    -   `__slots__` optimized Vehicle memory layout.
-    -   **Vectorized** AI Inference.
-    -   **Thread-Safe** Weight Synchronization (1Hz sync from Dreamer to Sim).
+-   : Python 3.11+ / FastAPI / WebSockets.
 
 ---
 
@@ -64,11 +58,11 @@ python -m backend.main
 ### 3. Play
 Open your browser to: **[http://localhost:9999](http://localhost:9999)**
 
-*Note: On the first run, the simulation will download ~15MB of map data from Overpass API. This may take 10-20 seconds. Subsequent runs will use the cached map.*
+*Note: On the first run, the simulation will download ~15MB of map data from Overpass API. This may take 10-20 seconds ( or maybe a touch more ). Subsequent runs will use the cached map.*
 
 ---
 
-## 🕹️ Controls
+## Controls
 
 | Control | Function |
 | :--- | :--- |
@@ -78,7 +72,7 @@ Open your browser to: **[http://localhost:9999](http://localhost:9999)**
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 -   `backend/` - Core simulation logic.
     -   `sim.py`: Physics engine, gap logic, and main loop.
@@ -91,4 +85,4 @@ Open your browser to: **[http://localhost:9999](http://localhost:9999)**
 
 ---
 
-**Built with ❤️ for Prishtina.**
+**Built with ❤️ for Prishtina from Murat Mehmeti.**
