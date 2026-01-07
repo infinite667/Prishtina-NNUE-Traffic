@@ -28,11 +28,11 @@ It features a cutting-edge **Hybrid AI System** that combines classical pathfind
 
 ##  Backend Architecture
 
--   : Python 3.11+ / FastAPI / WebSockets.
+- Python 3.11+ / FastAPI / WebSockets.
 
 ---
 
-## 📦 Installation & Run
+## Installation & Run
 
 ### Prerequisites
 -   Python 3.9+
