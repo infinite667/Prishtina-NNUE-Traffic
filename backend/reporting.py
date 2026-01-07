@@ -42,22 +42,39 @@ class SimReporter:
     def __post_init__(self) -> None:
         # Base folder for all runs
         self.out_dir = self.project_root / "sim_saves"
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        # Patch 4: Lazy folder creation
+        # Do NOT create folders here. Wait for first log.
+        # self.out_dir.mkdir(parents=True, exist_ok=True)
 
         # Per-run folder
         ts = pd.Timestamp.now().strftime("%Y-%m-%d_%H-%M-%S")
-        run_dir = self.out_dir / f"Sim-Results-{ts}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
+        self._run_dir_name = f"Sim-Results-{ts}"
+        
         base = f"sim_results_{ts}"
-        self.csv_path = run_dir / f"{base}.csv"
-        self.wait_png_path = run_dir / f"{base}_waiting.png"
-        self.cars_png_path = run_dir / f"{base}_cars.png"
+        self._base_name = base
+        # Defer path construction until we know the dir exists
+        self.csv_path = None 
+        self.wait_png_path = None
+        self.cars_png_path = None
+        
+        # Flag to init later
+        self._initialized = False
 
     def maybe_log(self, sim_time_s: float, cars_in_city: int, avg_waiting_s: float, ai_enabled: bool) -> None:
         """
         Append one row per integer second of simulation time.
         """
+        # Patch 4: Lazy init
+        if not self._initialized:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            run_dir = self.out_dir / self._run_dir_name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            
+            self.csv_path = run_dir / f"{self._base_name}.csv"
+            self.wait_png_path = run_dir / f"{self._base_name}_waiting.png"
+            self.cars_png_path = run_dir / f"{self._base_name}_cars.png"
+            self._initialized = True
+
         sec = int(sim_time_s)
         if sec == self._last_logged_sec:
             return

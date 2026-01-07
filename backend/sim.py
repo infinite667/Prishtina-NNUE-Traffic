@@ -61,11 +61,42 @@ class TrafficLight:
     offset_s: float = 0.0
     # For simplicity we treat lights as a 2-phase signal: green/yellow/red (for "its direction").
     # In real networks, direction groups are complex; here it mainly creates queuing behavior.
-    def state(self, t: float) -> str:
-        x = (t + self.offset_s) % self.cycle_s
-        if x < self.green_s:
+    def state(self, t: float, ai_enabled: bool = False) -> str:
+        # Patch 5: Adaptive timings based on AI state
+        # AI ON: Normal (adaptive) timings
+        # AI OFF: Green reduced by 30%, Red increased by 15% (implied by shorter green)
+        
+        cycle = self.cycle_s
+        green = self.green_s
+        yellow = self.yellow_s
+        
+        if not ai_enabled:
+            # "Green timer reduced by 30%"
+            green *= 0.7
+            # "Red light increased by 15%" -> This creates a conflict if we only have fixed cycle.
+            # Usually red = cycle - green - yellow.
+            # If we reduce green, red automatically increases.
+            # Let's trust the "shorter green" instruction primarily for the split.
+            # To specifically increase red time by 15% relative to normal red?
+            # Normal Red = 60 - 27 - 3 = 30.
+            # Target Red = 30 * 1.15 = 34.5.
+            # New Green = 27 * 0.7 = 18.9.
+            # Yellow = 3.
+            # Total = 18.9 + 3 + 34.5 = 56.4s / 60s.
+            # To keep cycle constant, we just strictly cut Green.
+            pass
+        else:
+            # AI ON: "add a 10% more green time (adaptive) and also reduce the red traffic time by 5% (adaptive)"
+            original_red = cycle - green - yellow
+            green = green * 1.10
+            new_red = original_red * 0.95
+            # Recompute cycle to fit these new durations
+            cycle = green + yellow + new_red
+
+        x = (t + self.offset_s) % cycle
+        if x < green:
             return "GREEN"
-        if x < self.green_s + self.yellow_s:
+        if x < green + yellow:
             return "YELLOW"
         return "RED"
 
@@ -162,6 +193,9 @@ class Simulation:
         # tick (which can freeze the browser due to massive marker churn).
         self.max_spawn_per_step = 35
         self.max_remove_per_reconcile = 150
+        
+        # Optimization cache
+        self._penalty_cache: Dict[Tuple[int, int], float] = {}
 
     def reconcile_fleet(self) -> None:
         """Immediately reconcile the active fleet size with the current target.
@@ -242,6 +276,16 @@ class Simulation:
 
     def _load_lights(self) -> List[TrafficLight]:
         geo = json.loads((self.data_dir / "traffic_lights.geojson").read_text(encoding="utf-8"))
+        
+        # Patch 1 & 2: Load signal overrides if present
+        signal_overrides = {}
+        sig_path = self.data_dir / "traffic_signal.json"
+        if sig_path.exists():
+            try:
+                signal_overrides = json.loads(sig_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
         lights: List[TrafficLight] = []
         for i, feat in enumerate(geo.get("features", [])):
             geom = feat.get("geometry") or {}
@@ -251,11 +295,25 @@ class Simulation:
             if len(coords) < 2:
                 continue
             lon, lat = float(coords[0]), float(coords[1])
+            
+            tid = str(feat.get("id") or f"tl_{i}")
+            
+            # Apply overrides or defaults
+            # Default: cycle=60, green=27, yellow=3
+            over = signal_overrides.get(tid, {})
+            cycle = float(over.get("cycle_s", 60.0))
+            green = float(over.get("green_s", 27.0))
+            yellow = float(over.get("yellow_s", 3.0))
+            offset = float(over.get("offset_s", random.random() * 60.0))
+
             lights.append(TrafficLight(
-                id=str(feat.get("id") or f"tl_{i}"),
+                id=tid,
                 lat=lat,
                 lon=lon,
-                offset_s=random.random() * 60.0,
+                cycle_s=cycle,
+                green_s=green,
+                yellow_s=yellow,
+                offset_s=offset,
             ))
         return lights
 
@@ -303,7 +361,7 @@ class Simulation:
                 "id": tl.id,
                 "lat": tl.lat,
                 "lon": tl.lon,
-                "state": tl.state(self.sim_time),
+                "state": tl.state(self.sim_time, self.settings.nnue_enabled),
                 "node": self.light_node.get(tl.id),
             })
         return out
@@ -462,12 +520,21 @@ class Simulation:
             hw = self.graph.edges.get((u, v), {}).get("highway", "")
             if hw in ("secondary", "tertiary"):
                 base_speed = 16.5
+                # Patch 6.6: Prefer secondary/tertiary roads more aggressively (15% cheaper)
+                # to "re-route cars more to secondary or tertiary roads".
+                # We apply this discount to the base length calculation.
             elif hw in ("residential", "unclassified", "service"):
                 base_speed = 14.5
         
         length_m = self.graph.edge_length_m(u, v)
         # Recalculate base cost with virtual speed
         base = length_m / max(1.0, base_speed)
+
+        # Apply preference discount for secondary/tertiary if AI is on
+        if self.settings.nnue_enabled:
+             hw = self.graph.edges.get((u, v), {}).get("highway", "")
+             if hw in ("secondary", "tertiary"):
+                 base *= 0.85
 
         occ = float(self.edge_occupancy.get((u, v), 0))
         cap = float(self.graph.edge_capacity(u, v))
@@ -478,7 +545,13 @@ class Simulation:
         # Aggressive Rerouting (Phase 2):
         # Increase penalty for average waiting time to force rerouting
         # The AI will now hate traffic jams 6x more than before.
-        mult = self.ai.penalty_multiplier(u, v, base, occ, cap, red, avgw * 6.0)
+        # Per-tick cache for penalty multiplier (Optimization)
+        cache_key = (u, v)
+        if cache_key in self._penalty_cache:
+            mult = self._penalty_cache[cache_key]
+        else:
+            mult = self.ai.penalty_multiplier(u, v, base, occ, cap, red, avgw * 6.0)
+            self._penalty_cache[cache_key] = mult
         return base * mult
 
     def _heuristic_time_to_dest(self, node: int, dest: int) -> float:
@@ -642,7 +715,7 @@ class Simulation:
                     red = 0.0
                     for tl in self.lights:
                         if self.light_node.get(tl.id) == v:
-                            red = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
+                            red = 1.0 if tl.state(self.sim_time, self.settings.nnue_enabled) == "RED" else 0.0
                             break
                     cost += 6.0 * red
 
@@ -714,10 +787,13 @@ class Simulation:
                 nid = self.light_node.get(tl.id)
                 if nid is None:
                     continue
-                node_red[int(nid)] = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
+                node_red[int(nid)] = 1.0 if tl.state(self.sim_time, self.settings.nnue_enabled) == "RED" else 0.0
         except Exception:
             node_red = {}
         self._node_red_cache = node_red
+        
+        # Reset penalty cache
+        self._penalty_cache = {}
 
         # NOTE: We intentionally DO NOT run full shortest-path routing per vehicle here.
         # Doing Dijkstra thousands of times per second will freeze the server and UI.
@@ -797,7 +873,7 @@ class Simulation:
                 # Optimized O(1) check
                 tl = self.node_to_light.get(w)
                 if tl:
-                    st = tl.state(self.sim_time)
+                    st = tl.state(self.sim_time, self.settings.nnue_enabled)
                     if st == "RED":
                         if self.sim_time < getattr(v, "green_immunity_until", 0.0):
                             must_stop_light = False
@@ -904,7 +980,7 @@ class Simulation:
             # Optimized O(1) check
             tl = self.node_to_light.get(w)
             if tl:
-                light_state = tl.state(self.sim_time)
+                light_state = tl.state(self.sim_time, self.settings.nnue_enabled)
                 light_is_red = (light_state == "RED")
 
             for v in vs:
