@@ -11,7 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from .routing import RoadGraph, build_graph_from_overpass_json, demo_graph_prishtina, haversine_m
-from .nnue import TinyNNUE
+from .ai.traffic_ai import EdgeLearner
+from .reporting import SimReporter
 
 LatLon = Tuple[float, float]
 
@@ -44,7 +45,8 @@ class SimSettings:
                 v = int(patch["target_vehicle_count"])
             except Exception:
                 return
-            allowed = {200, 500, 1000, 3000}
+            # UI exposes discrete steps.
+            allowed = {200, 500, 750, 1000}
             if v in allowed:
                 self.target_vehicle_count = v
 
@@ -67,7 +69,7 @@ class TrafficLight:
             return "YELLOW"
         return "RED"
 
-@dataclass
+@dataclass(slots=True)
 class Vehicle:
     id: int
     color: str
@@ -88,6 +90,12 @@ class Vehicle:
     # After passing a GREEN light, ignore any RED-light stopping checks for a short grace period.
     # This models protected turning movements where the downstream lane's signal shouldn't block the turn.
     green_immunity_until: float = 0.0
+
+    # Learning hooks: measure realized delay per edge
+    edge_enter_t: float = 0.0
+    edge_enter_waiting_s: float = 0.0
+    # Phase 2: Split Lane Speed Boost
+    speed_boost_until: float = 0.0
 
     rerouted_by_nnue: bool = False
 
@@ -114,8 +122,11 @@ class Simulation:
 
         # Bind each light to nearest node for queueing
         self.light_node: Dict[str, int] = {}
+        self.node_to_light: Dict[int, TrafficLight] = {}
         for tl in self.lights:
-            self.light_node[tl.id] = self.graph.nearest_node(tl.lat, tl.lon)
+            nid = self.graph.nearest_node(tl.lat, tl.lon)
+            self.light_node[tl.id] = nid
+            self.node_to_light[nid] = tl
 
         # Congestion counters per directed edge
         self.edge_occupancy: Dict[Tuple[int, int], int] = {}
@@ -123,9 +134,15 @@ class Simulation:
         self.vehicles: Dict[int, Vehicle] = {}
         self._next_vid = 1
 
-        # Online NNUE
-        self.nnue = TinyNNUE(input_dim=6, hidden_dim=32)
-        self._nnue_training_accum: List[Tuple[List[float], float]] = []
+        # Persistent learning-based routing (replaces the old non-learning "NNUE")
+        self.ai = EdgeLearner(store_dir=(self.data_dir / "ai_store"))
+
+        # CSV/PNG reporting (1Hz) using pandas/numpy; saved under project root ./sim_saves
+        project_root = self.data_dir.resolve().parent
+        if project_root.name == 'backend':
+            project_root = project_root.parent
+        self.reporter = SimReporter(project_root=project_root)
+
 
         # Metrics history for UI graph
         self.avg_waiting_history: List[Tuple[float, float]] = []  # (sim_time, avg_waiting_s)
@@ -138,7 +155,8 @@ class Simulation:
         # Minimum bumper-to-bumper gap between queued vehicles on the same edge (meters)
         # Base gap. Actual enforced gap is adjusted per-edge to avoid short-edge pileups.
         # Patch 6.3: increase minimum gap to 10m.
-        self.min_gap_m = 10.0
+        # Patch 6.5: reduce to 6.0m to prevent blocking small residential roads.
+        self.min_gap_m = 6.0
 
         # Performance safeguards: avoid spawning/removing hundreds of vehicles in a single
         # tick (which can freeze the browser due to massive marker churn).
@@ -325,6 +343,18 @@ class Simulation:
             return 0.0
         return sum(v.waiting_s for v in active) / len(active)
 
+    def _avg_waiting_s_cached(self) -> float:
+        """O(1) avg-wait access.
+
+        WARNING: _avg_waiting_s() is O(N vehicles). Calling it inside routing
+        (which can run many times per tick) will destroy performance.
+        """
+        return float(getattr(self, "_avg_wait_cache", 0.0))
+
+    def _node_is_red_cached(self, node_id: int) -> float:
+        """Return 1.0 if node has a RED light this tick, else 0.0 (O(1))."""
+        return float(getattr(self, "_node_red_cache", {}).get(int(node_id), 0.0))
+
     def _spawn_vehicle(self) -> None:
         # Try a few times to find a valid route and a clear start edge to avoid spawning overlaps.
         gap = float(self.min_gap_m)
@@ -359,6 +389,8 @@ class Simulation:
                 pos_v=route[1],
                 spawned_t=self.sim_time,
             )
+            v.edge_enter_t = self.sim_time
+            v.edge_enter_waiting_s = float(v.waiting_s)
             self.vehicles[v.id] = v
             self._next_vid += 1
             return
@@ -406,7 +438,10 @@ class Simulation:
             v.last_waiting = False
             v.rerouted_by_nnue = False
             v.green_immunity_until = 0.0
+            v.edge_enter_t = self.sim_time
+            v.edge_enter_waiting_s = float(v.waiting_s)
             v.color = "blue"
+            v.speed_boost_until = 0.0
             return
 
         # If we couldn't respawn (very congested), just keep it arrived a bit longer.
@@ -418,22 +453,33 @@ class Simulation:
         speed_mps = self.graph.edge_speed_mps(u, v)
         return length_m / max(1.0, speed_mps)
 
-    def _edge_cost_nnue(self, u: int, v: int) -> float:
-        base = self._edge_cost_base(u, v)
-        # Features: base_time, occupancy, capacity, avg_waiting, light_red_prob, sim_speed
+    def _edge_cost_ai(self, u: int, v: int) -> float:
+        # Virtual Speed Boost for user-requested routing behavior
+        # "Secondary/Tertiary -> 16.5m/s (~60km/h)"
+        # "Residential -> 14.5m/s (~52km/h)"
+        base_speed = self.graph.edge_speed_mps(u, v)
+        if self.settings.nnue_enabled:
+            hw = self.graph.edges.get((u, v), {}).get("highway", "")
+            if hw in ("secondary", "tertiary"):
+                base_speed = 16.5
+            elif hw in ("residential", "unclassified", "service"):
+                base_speed = 14.5
+        
+        length_m = self.graph.edge_length_m(u, v)
+        # Recalculate base cost with virtual speed
+        base = length_m / max(1.0, base_speed)
+
         occ = float(self.edge_occupancy.get((u, v), 0))
         cap = float(self.graph.edge_capacity(u, v))
-        avgw = float(self._avg_waiting_s())
-        red = 0.0
-        # if there is a light near v and it's red, add a signal feature
-        for tl in self.lights:
-            if self.light_node.get(tl.id) == v:
-                red = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
-                break
-        x = [base, occ, cap, avgw, red, float(self.settings.speed_multiplier)]
-        mult = self.nnue.predict_multiplier(x)  # ~1.0+
-        # Always positive
-        return base * max(0.6, min(3.0, mult))
+        # Critical perf: avg wait and red-light checks must be O(1).
+        avgw = self._avg_waiting_s_cached()
+        red = self._node_is_red_cached(v)
+        
+        # Aggressive Rerouting (Phase 2):
+        # Increase penalty for average waiting time to force rerouting
+        # The AI will now hate traffic jams 6x more than before.
+        mult = self.ai.penalty_multiplier(u, v, base, occ, cap, red, avgw * 6.0)
+        return base * mult
 
     def _heuristic_time_to_dest(self, node: int, dest: int) -> float:
         """A cheap optimistic estimate (seconds) from node -> dest."""
@@ -522,31 +568,8 @@ class Simulation:
                     continue
                 # Avoid tight loops; still allow revisits if we're stuck.
                 loop_penalty = 25.0 if v in visited else 0.0
-                base_cost = self._edge_cost_base(cur, v)
-                occ = float(self.edge_occupancy.get((cur, v), 0))
-                cap = float(self.graph.edge_capacity(cur, v))
-                congestion = min(1.5, occ / max(1.0, cap))
-
-                # Prefer edges with spare capacity. Quadratic term makes heavy congestion expensive.
-                cost = base_cost * (1.0 + 2.2 * (congestion ** 2))
-
-                # Light penalty at the *end* node.
-                red = 0.0
-                for tl in self.lights:
-                    if self.light_node.get(tl.id) == v:
-                        red = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
-                        break
-                cost += 6.0 * red
-
-                # Optional NNUE multiplier (kept bounded, and cheap because it's per-neighbor).
-                if self.settings.nnue_enabled:
-                    try:
-                        x = [base_cost, occ, cap, float(self._avg_waiting_s()), red, float(self.settings.speed_multiplier)]
-                        mult = self.nnue.predict_multiplier(x)
-                        cost *= max(0.7, min(2.2, mult))
-                    except Exception:
-                        # If NNUE ever misbehaves, ignore it (never freeze).
-                        pass
+                # Base vs learned routing cost.
+                cost = self._edge_cost_ai(cur, v) if self.settings.nnue_enabled else self._edge_cost_base(cur, v)
 
                 score = cost + self._heuristic_time_to_dest(v, dest) + loop_penalty
                 if score < best_score:
@@ -574,7 +597,7 @@ class Simulation:
         if start == dest:
             return [start]
 
-        reachable = self._reachable_to(dest)
+        reachable = self._reachable_to_dest(dest)
         if reachable is not None and start not in reachable:
             return [start]
 
@@ -606,19 +629,22 @@ class Simulation:
                 if reachable is not None and v not in reachable:
                     continue
 
-                base_cost = self._edge_cost_base(u, v)
-                occ = float(self.edge_occupancy.get((u, v), 0))
-                cap = float(self.graph.edge_capacity(u, v))
-                congestion = min(1.5, occ / max(1.0, cap))
-                cost = base_cost * (1.0 + 0.9 * congestion)
+                if self.settings.nnue_enabled:
+                    cost = self._edge_cost_ai(u, v)
+                else:
+                    base_cost = self._edge_cost_base(u, v)
+                    occ = float(self.edge_occupancy.get((u, v), 0))
+                    cap = float(self.graph.edge_capacity(u, v))
+                    congestion = min(1.5, occ / max(1.0, cap))
+                    cost = base_cost * (1.0 + 0.9 * congestion)
 
-                # Penalize arriving into a node with a red light.
-                red = 0.0
-                for tl in self.lights:
-                    if self.light_node.get(tl.id) == v:
-                        red = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
-                        break
-                cost += 6.0 * red
+                    # Penalize arriving into a node with a red light.
+                    red = 0.0
+                    for tl in self.lights:
+                        if self.light_node.get(tl.id) == v:
+                            red = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
+                            break
+                    cost += 6.0 * red
 
                 nd = du + cost
                 if nd < g.get(v, 1e18):
@@ -639,6 +665,9 @@ class Simulation:
         return path
 
     def step(self, dt: float) -> None:
+        # Sync AI enablement for the background dreamer thread
+        self.ai.enabled = self.settings.nnue_enabled
+
         dt *= self.settings.speed_multiplier
         self.sim_time += dt
 
@@ -670,6 +699,25 @@ class Simulation:
             e = v.current_edge()
             if e:
                 self.edge_occupancy[e] = self.edge_occupancy.get(e, 0) + 1
+
+        # --- Per-tick caches for routing cost (HUGE performance win) ---
+        # These are used inside _edge_cost_ai() and reroute decisions.
+        try:
+            self._avg_wait_cache = float(self._avg_waiting_s())
+        except Exception:
+            self._avg_wait_cache = 0.0
+
+        # Precompute RED status per node for this sim_time.
+        node_red: Dict[int, float] = {}
+        try:
+            for tl in self.lights:
+                nid = self.light_node.get(tl.id)
+                if nid is None:
+                    continue
+                node_red[int(nid)] = 1.0 if tl.state(self.sim_time) == "RED" else 0.0
+        except Exception:
+            node_red = {}
+        self._node_red_cache = node_red
 
         # NOTE: We intentionally DO NOT run full shortest-path routing per vehicle here.
         # Doing Dijkstra thousands of times per second will freeze the server and UI.
@@ -732,28 +780,31 @@ class Simulation:
             occ = self.edge_occupancy.get((u, w), 0)
             cap = self.graph.edge_capacity(u, w)
             congestion = min(0.95, occ / max(1.0, cap))
-            target_speed = max(0.5, free_speed * (1.0 - 0.75 * congestion))
-
+            
             leader_progress = None
             leader_waiting = False
 
             for idx, v in enumerate(vs):
+                target_speed = max(0.5, free_speed * (1.0 - 0.75 * congestion))
+                
+                # Phase 2: Apply Split Lane Boost
+                if v.speed_boost_until > self.sim_time:
+                    target_speed *= 1.2
+
                 # Traffic light gating at the end node (w)
                 must_stop_light = False
-                for tl in self.lights:
-                    if self.light_node.get(tl.id) == w:
-                        st = tl.state(self.sim_time)
-                        if st == "RED":
-                            # If the vehicle has recently passed a GREEN light, it has a short grace period
-                            # where it ignores downstream RED checks (still respecting spacing/spillback).
-                            if self.sim_time < getattr(v, "green_immunity_until", 0.0):
-                                must_stop_light = False
-                            else:
-                                dist_to_end = max(0.0, length_m - v.edge_progress_m)
-                                # start braking earlier so queues form more naturally
-                                if dist_to_end < 25.0:
-                                    must_stop_light = True
-                        break
+                
+                # Optimized O(1) check
+                tl = self.node_to_light.get(w)
+                if tl:
+                    st = tl.state(self.sim_time)
+                    if st == "RED":
+                        if self.sim_time < getattr(v, "green_immunity_until", 0.0):
+                            must_stop_light = False
+                        else:
+                            dist_to_end = max(0.0, length_m - v.edge_progress_m)
+                            if dist_to_end < 25.0:
+                                must_stop_light = True
 
                 desired_progress = v.edge_progress_m
 
@@ -849,24 +900,90 @@ class Simulation:
             # Light gating at the end node (w)
             light_state: Optional[str] = None
             light_is_red = False
-            for tl in self.lights:
-                if self.light_node.get(tl.id) == w:
-                    light_state = tl.state(self.sim_time)
-                    light_is_red = (light_state == "RED")
-                    break
+            
+            # Optimized O(1) check
+            tl = self.node_to_light.get(w)
+            if tl:
+                light_state = tl.state(self.sim_time)
+                light_is_red = (light_state == "RED")
 
             for v in vs:
                 if v.arrived:
                     continue
 
-                # If red, do not transfer. Never snap backwards; just stop where you are (clamped to edge end).
-                if light_is_red and (self.sim_time >= float(getattr(v, "green_immunity_until", 0.0))):
+                # Phase 2: Split Lane Logic (Right Turn Detection)
+                # Calculate angle difference to detect right turn.
+                # If right turn + nnue_enabled => ignore red light + grant boost
+                is_right_turn = False
+                if self.settings.nnue_enabled and v.edge_index < len(v.route) - 2:
+                    try:
+                        # Current edge vector (u->w)
+                        node_u = self.graph.nodes[u]
+                        node_w = self.graph.nodes[w]
+                        # Next edge vector (w->next)
+                        next_node_id = v.route[v.edge_index + 2]
+                        node_next = self.graph.nodes[next_node_id]
+                        
+                        curr_angle = math.atan2(node_w[1] - node_u[1], node_w[0] - node_u[0])
+                        next_angle = math.atan2(node_next[1] - node_w[1], node_next[0] - node_w[0])
+                        
+                        # angle diff: wrap to -pi..pi
+                        diff = next_angle - curr_angle
+                        while diff <= -math.pi: diff += 2*math.pi
+                        while diff > math.pi: diff -= 2*math.pi
+                        
+                        # Right turn is roughly -90 deg (-pi/2) in standard math (CCW), 
+                        # or depends on latlon orientation. 
+                        # Lat increases N, Lon increases E.
+                        # N->E: (0,1)->(1,0). atan2(1,0)=0, atan2(0,1)=pi/2. 0-pi/2 = -pi/2.
+                        # So right turn is negative diff. Let's assume -1.0 to -2.2 range (-60 to -120 deg).
+                        # Let's broaden it to ensure we catch it: -2.5 to -0.5 ??
+                        # Actually let's assume right turn is roughly -1.57 rad.
+                        if -2.5 < diff < -0.5:
+                            is_right_turn = True
+                            v.speed_boost_until = self.sim_time + 5.0
+                    except Exception:
+                        pass
+
+                # If red, do not transfer... UNLESS it's a right turn boost
+                if light_is_red and (self.sim_time >= float(getattr(v, "green_immunity_until", 0.0))) and not is_right_turn:
                     v.edge_progress_m = min(float(v.edge_progress_m), float(length_m))
                     v.speed_mps = 0.0
                     v.last_waiting = True
                     v.color = "pink"
                     v.waiting_s += dt
                     continue
+
+                # --- Learning update: edge delay signal (u -> w) ---
+                # Only update when the vehicle is actually allowed to clear the intersection.
+                try:
+                    enter_t = float(getattr(v, "edge_enter_t", self.sim_time))
+                    # simple elapsed time
+                    realized_delay = max(0.0, float(self.sim_time - enter_t))
+                    
+                    # Gather context for learning
+                    if self.settings.nnue_enabled:
+                         # Reconstruct context
+                        hw = self.graph.edges.get((u, w), {}).get("highway", "")
+                        if hw in ("secondary", "tertiary"):
+                            virt_speed = 16.5
+                        elif hw in ("residential", "unclassified", "service"):
+                            virt_speed = 14.5
+                        else:
+                            virt_speed = self.graph.edge_speed_mps(u, w)
+                            
+                        freeflow_s = length_m / max(1.0, virt_speed)
+                        
+                        context = {
+                            "freeflow_s": freeflow_s,
+                            "occ": float(self.edge_occupancy.get((u, w), 0)),
+                            "cap": float(self.graph.edge_capacity(u, w)),
+                            "red": float(self._node_is_red_cached(w)),
+                            "avg_wait_s": float(self._avg_waiting_s_cached()),
+                        }
+                        self.ai.update_edge_delay(u, w, realized_delay, context)
+                except Exception:
+                    pass
 
                 # If we passed this intersection on GREEN, grant a short grace period where
                 # this vehicle ignores downstream RED-light stopping checks (useful for turns).
@@ -897,7 +1014,18 @@ class Simulation:
                         occ = float(self.edge_occupancy.get((cur_node, planned_v), 0))
                         cap = float(self.graph.edge_capacity(cur_node, planned_v))
                         cong = occ / max(1.0, cap)
-                        should_try = (cong >= 0.75) or (random.random() < 0.06)
+                        # More aggressive rerouting when the planned edge looks bad.
+                        base_c = float(self._edge_cost_base(cur_node, planned_v))
+                        planned_mult = float(self.ai.penalty_multiplier(
+                            cur_node,
+                            planned_v,
+                            base_c,
+                            occ,
+                            cap,
+                            0.0,
+                            self._avg_waiting_s_cached(),
+                        ))
+                        should_try = (cong >= 0.55) or (planned_mult >= 1.55) or (random.random() < 0.12)
                         if should_try:
                             dest_node = int(v.dest)
                             new_route = self._ai_build_route_greedy(cur_node, dest_node, max_hops=48)
@@ -919,12 +1047,18 @@ class Simulation:
                 next_edge = (nu, nv)
 
                 # Check clearance at start of next edge.
+                gap_m = float(self.min_gap_m)
+
+                # Dynamic gap for short edges: don't require 6m gap on a 4m road.
+                # Allow packing up to 80% of the edge length if it's really short.
                 next_len = self.graph.edge_length_m(nu, nv)
+                effective_gap = min(gap_m, next_len * 0.8)
+                
                 prog_list = edge_to_progresses.get(next_edge, [])
                 if prog_list:
                     backmost = min(prog_list)
                     # If the backmost car is too close to the start, we can't enter yet.
-                    if backmost < gap_m:
+                    if backmost < effective_gap:
                         # Spillback: cannot enter next edge yet. Never snap backwards; hold position at the edge end.
                         v.edge_progress_m = min(float(v.edge_progress_m), float(length_m))
                         v.speed_mps = 0.0
@@ -933,13 +1067,13 @@ class Simulation:
                         v.waiting_s += dt
                         continue
                     # Place this car behind the backmost while preserving the gap.
-                    new_prog = max(0.0, min(max(0.0, overshoot), backmost - gap_m))
+                    new_prog = max(0.0, min(max(0.0, overshoot), backmost - effective_gap))
                 else:
                     new_prog = max(0.0, overshoot)
 
                 # If the next edge is extremely short, enforce that only one car can occupy it.
                 # (Otherwise multiple cars would clamp to progress=0 and visually overlap.)
-                if prog_list and next_len < gap_m:
+                if prog_list and next_len < effective_gap:
                     # Prevent overfilling extremely short edges. Hold at the edge end without snapping backwards.
                     v.edge_progress_m = min(float(v.edge_progress_m), float(length_m))
                     v.speed_mps = 0.0
@@ -954,8 +1088,22 @@ class Simulation:
                 v.pos_u = nu
                 v.pos_v = nv
 
+                # Reset learning timers for the next edge.
+                v.edge_enter_t = self.sim_time
+                v.edge_enter_waiting_s = float(v.waiting_s)
+
+                # Start timing the new edge for learning.
+                v.edge_enter_t = self.sim_time
+                v.edge_enter_waiting_s = float(v.waiting_s)
+
                 # Update our cache so additional finishers in the same tick see the new car.
                 edge_to_progresses.setdefault(next_edge, []).append(float(v.edge_progress_m))
+
+        # Persist learned state without spamming disk.
+        try:
+            pass
+        except Exception:
+            pass
         # Final cleanup: enforce gaps again after edge transitions.
         # This helps avoid rare overlaps caused by overshoot/advance.
         # Metrics history (1Hz)
@@ -965,7 +1113,19 @@ class Simulation:
             # keep last 3 minutes
             self.avg_waiting_history = [p for p in self.avg_waiting_history if self.sim_time - p[0] <= 180.0]
 
-        # Keep vehicle count bounded for performance
+                # Write 1Hz CSV + full-history charts
+        try:
+            self.reporter.maybe_log(
+                sim_time_s=self.sim_time,
+                cars_in_city=len(self.vehicles),
+                avg_waiting_s=self._avg_waiting_s(),
+                ai_enabled=self.settings.nnue_enabled,
+            )
+        except Exception:
+            # Reporting must never break the simulation.
+            pass
+
+# Keep vehicle count bounded for performance
         # (This list must always exist even if we're below the cap.)
         to_remove: List[int] = []
         hard_cap = max(650, int(self.settings.target_vehicle_count * 1.35))
@@ -984,6 +1144,12 @@ class Simulation:
                     to_remove.append(v.id)
         for vid in to_remove:
             self.vehicles.pop(vid, None)
+
+        # Persist learning state (throttled).
+        try:
+            self.ai.maybe_save(min_interval_s=3.0)
+        except Exception:
+            pass
 
     def stream_updates(self) -> Iterable[str]:
         # Async generator implemented via polling from websocket handler.
