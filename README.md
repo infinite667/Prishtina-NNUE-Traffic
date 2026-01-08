@@ -6,7 +6,7 @@ It features a cutting-edge **Hybrid AI System** that combines classical pathfind
 
 ## Some of the key Features
 
-### 1. Smart Traffic AI (The "Dreamer")
+### 1. Smart Traffic AI (The "Dreamer") - In ongoing implementation
 -   **Neural Network Update Engine (NNUE)**: A vectorized Numpy-based neural network that learns to predict edge delays.
 -   **Background "Dreamer" Mode**: The AI trains on a **background thread** (Multi-threaded Double Buffering), allowing it to "dream" (replay) past traffic scenarios and optimize its brain 100x/sec without slowing down the simulation.
 -   **Live Learning**: Watch the AI get smarter over time! When enabled, cars dynamically reroute to avoid developing jams, utilizing side streets effectively.
